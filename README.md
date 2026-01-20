@@ -254,4 +254,4 @@ The test suite includes 78 tests covering:
 
 ## License
 
-MIT License
+Apache 2.0 License
