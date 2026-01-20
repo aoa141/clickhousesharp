@@ -81,6 +81,12 @@ public class QueryExecutor
                 return ExecuteAggregateWithoutGroupBy(select, sourceRows);
             }
 
+            // Evaluate window functions before DISTINCT and ORDER BY
+            if (HasWindowFunctions(select.Columns))
+            {
+                EvaluateWindowFunctions(select.Columns, sourceRows);
+            }
+
             // Apply DISTINCT if needed
             if (select.Distinct)
             {
@@ -517,17 +523,27 @@ public class QueryExecutor
     }
 
     private (string Name, ClickHouseValue Value, ClickHouseType Type) EvaluateSelectExpression(
-        Expression expr, RowContext row, List<RowContext>? groupRows = null)
+        Expression expr, RowContext row, List<RowContext>? groupRows = null, int windowIndex = -1)
     {
         if (expr is AliasedExpression alias)
         {
-            var (_, value, type) = EvaluateSelectExpression(alias.Expression, row, groupRows);
+            var (_, value, type) = EvaluateSelectExpression(alias.Expression, row, groupRows, windowIndex);
             return (alias.Alias, value, type);
         }
 
         if (expr is FunctionCallExpression func && _functions.IsAggregateFunction(func.FunctionName))
         {
             return EvaluateAggregateFunction(func, groupRows ?? [row]);
+        }
+
+        if (expr is WindowFunctionExpression winExpr)
+        {
+            var windowKey = $"__window_{windowIndex}";
+            if (row.TryGetColumn(windowKey, out var value) && value != null)
+            {
+                return (winExpr.Function.FunctionName, value, value.Type);
+            }
+            throw new InvalidOperationException($"Window function value not found for {winExpr.Function.FunctionName}");
         }
 
         var val = _evaluator.Evaluate(expr, row);
@@ -584,12 +600,17 @@ public class QueryExecutor
         // Expand star expressions first
         var expandedColumns = ExpandStarExpressions(columns, rows.Count > 0 ? rows[0] : null);
 
+        // Build map of column index to window function index
+        var windowIndices = BuildWindowIndexMap(expandedColumns);
+
         // Build column metadata
         if (rows.Count > 0)
         {
-            foreach (var col in expandedColumns)
+            for (int i = 0; i < expandedColumns.Count; i++)
             {
-                var (name, value, type) = EvaluateSelectExpression(col, rows[0]);
+                var col = expandedColumns[i];
+                var windowIdx = windowIndices.GetValueOrDefault(i, -1);
+                var (name, value, type) = EvaluateSelectExpression(col, rows[0], null, windowIdx);
                 resultColumns.Add(new ResultColumn(name, type));
             }
         }
@@ -598,15 +619,37 @@ public class QueryExecutor
         foreach (var row in rows)
         {
             var values = new List<ClickHouseValue>();
-            foreach (var col in expandedColumns)
+            for (int i = 0; i < expandedColumns.Count; i++)
             {
-                var (_, value, _) = EvaluateSelectExpression(col, row);
+                var col = expandedColumns[i];
+                var windowIdx = windowIndices.GetValueOrDefault(i, -1);
+                var (_, value, _) = EvaluateSelectExpression(col, row, null, windowIdx);
                 values.Add(value);
             }
             resultRows.Add(new ResultRow(values.ToArray()));
         }
 
         return (resultColumns, resultRows);
+    }
+
+    private Dictionary<int, int> BuildWindowIndexMap(List<Expression> columns)
+    {
+        var map = new Dictionary<int, int>();
+        int windowIndex = 0;
+
+        for (int colIdx = 0; colIdx < columns.Count; colIdx++)
+        {
+            var expr = columns[colIdx];
+            if (expr is AliasedExpression alias)
+                expr = alias.Expression;
+
+            if (expr is WindowFunctionExpression)
+            {
+                map[colIdx] = windowIndex++;
+            }
+        }
+
+        return map;
     }
 
     private List<Expression> ExpandStarExpressions(IReadOnlyList<Expression> columns, RowContext? sampleRow)
@@ -654,7 +697,333 @@ public class QueryExecutor
             CaseExpression caseExpr => caseExpr.WhenClauses.Any(w =>
                 ContainsAggregateFunction(w.Condition) || ContainsAggregateFunction(w.Result)) ||
                 (caseExpr.ElseResult != null && ContainsAggregateFunction(caseExpr.ElseResult)),
+            WindowFunctionExpression => false, // Window functions are not aggregate functions
             _ => false
+        };
+    }
+
+    private bool HasWindowFunctions(IReadOnlyList<Expression> columns)
+    {
+        foreach (var col in columns)
+        {
+            if (ContainsWindowFunction(col))
+                return true;
+        }
+        return false;
+    }
+
+    private bool ContainsWindowFunction(Expression expr)
+    {
+        return expr switch
+        {
+            WindowFunctionExpression => true,
+            AliasedExpression alias => ContainsWindowFunction(alias.Expression),
+            BinaryExpression bin => ContainsWindowFunction(bin.Left) || ContainsWindowFunction(bin.Right),
+            UnaryExpression un => ContainsWindowFunction(un.Operand),
+            FunctionCallExpression func => func.Arguments.Any(ContainsWindowFunction),
+            CaseExpression caseExpr => caseExpr.WhenClauses.Any(w =>
+                ContainsWindowFunction(w.Condition) || ContainsWindowFunction(w.Result)) ||
+                (caseExpr.ElseResult != null && ContainsWindowFunction(caseExpr.ElseResult)),
+            _ => false
+        };
+    }
+
+    private void EvaluateWindowFunctions(IReadOnlyList<Expression> columns, List<RowContext> rows)
+    {
+        var windowExprs = new List<(WindowFunctionExpression Expr, int Index)>();
+        int windowIndex = 0;
+        foreach (var col in columns)
+        {
+            CollectWindowFunctions(col, windowExprs, ref windowIndex);
+        }
+
+        foreach (var (winExpr, idx) in windowExprs)
+        {
+            EvaluateSingleWindowFunction(winExpr, idx, rows);
+        }
+    }
+
+    private void CollectWindowFunctions(Expression expr, List<(WindowFunctionExpression, int)> results, ref int index)
+    {
+        switch (expr)
+        {
+            case WindowFunctionExpression winExpr:
+                results.Add((winExpr, index++));
+                break;
+            case AliasedExpression alias:
+                CollectWindowFunctions(alias.Expression, results, ref index);
+                break;
+            case BinaryExpression bin:
+                CollectWindowFunctions(bin.Left, results, ref index);
+                CollectWindowFunctions(bin.Right, results, ref index);
+                break;
+            case UnaryExpression un:
+                CollectWindowFunctions(un.Operand, results, ref index);
+                break;
+            case FunctionCallExpression func:
+                foreach (var arg in func.Arguments)
+                    CollectWindowFunctions(arg, results, ref index);
+                break;
+        }
+    }
+
+    private void EvaluateSingleWindowFunction(WindowFunctionExpression winExpr, int windowIndex, List<RowContext> rows)
+    {
+        var window = winExpr.Window;
+        var func = winExpr.Function;
+        var funcName = func.FunctionName.ToLowerInvariant();
+
+        // Group rows by partition key
+        var partitions = new Dictionary<string, List<(RowContext Row, int OriginalIndex)>>();
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var row = rows[i];
+            var partitionKey = window.PartitionBy != null && window.PartitionBy.Count > 0
+                ? string.Join("\0", window.PartitionBy.Select(e => _evaluator.Evaluate(e, row).RawValue?.ToString() ?? "NULL"))
+                : "";
+
+            if (!partitions.TryGetValue(partitionKey, out var partition))
+            {
+                partition = new List<(RowContext, int)>();
+                partitions[partitionKey] = partition;
+            }
+            partition.Add((row, i));
+        }
+
+        foreach (var partition in partitions.Values)
+        {
+            // Sort partition by ORDER BY if specified
+            if (window.OrderBy != null && window.OrderBy.Count > 0)
+            {
+                partition.Sort((a, b) =>
+                {
+                    foreach (var item in window.OrderBy)
+                    {
+                        var aVal = _evaluator.Evaluate(item.Expression, a.Row);
+                        var bVal = _evaluator.Evaluate(item.Expression, b.Row);
+
+                        int cmp;
+                        if (aVal.IsNull && bVal.IsNull) cmp = 0;
+                        else if (aVal.IsNull) cmp = -1;
+                        else if (bVal.IsNull) cmp = 1;
+                        else cmp = aVal.CompareTo(bVal);
+
+                        if (item.Descending) cmp = -cmp;
+                        if (cmp != 0) return cmp;
+                    }
+                    return 0;
+                });
+            }
+
+            ComputeWindowValues(funcName, func, window, partition, windowIndex);
+        }
+    }
+
+    private void ComputeWindowValues(string funcName, FunctionCallExpression func, WindowSpec window,
+        List<(RowContext Row, int OriginalIndex)> partition, int windowIndex)
+    {
+        var windowKey = $"__window_{windowIndex}";
+
+        switch (funcName)
+        {
+            case "row_number":
+                for (int i = 0; i < partition.Count; i++)
+                    partition[i].Row.SetColumn(windowKey, new Int64Value(i + 1));
+                break;
+
+            case "rank":
+                ComputeRank(func, window, partition, windowKey, withGaps: true);
+                break;
+
+            case "dense_rank":
+                ComputeRank(func, window, partition, windowKey, withGaps: false);
+                break;
+
+            case "ntile":
+                var buckets = func.Arguments.Count > 0
+                    ? (int)_evaluator.Evaluate(func.Arguments[0], new RowContext()).AsInt64()
+                    : 1;
+                for (int i = 0; i < partition.Count; i++)
+                {
+                    var bucket = (int)((long)i * buckets / partition.Count) + 1;
+                    partition[i].Row.SetColumn(windowKey, new Int64Value(bucket));
+                }
+                break;
+
+            case "lag":
+                ComputeLagLead(func, partition, windowKey, isLag: true);
+                break;
+
+            case "lead":
+                ComputeLagLead(func, partition, windowKey, isLag: false);
+                break;
+
+            case "first_value":
+                if (func.Arguments.Count > 0)
+                {
+                    var firstVal = _evaluator.Evaluate(func.Arguments[0], partition[0].Row);
+                    foreach (var (row, _) in partition)
+                        row.SetColumn(windowKey, firstVal);
+                }
+                break;
+
+            case "last_value":
+                if (func.Arguments.Count > 0)
+                {
+                    for (int i = 0; i < partition.Count; i++)
+                    {
+                        var frameEnd = GetFrameEnd(window.Frame, i, partition.Count);
+                        var lastVal = _evaluator.Evaluate(func.Arguments[0], partition[frameEnd].Row);
+                        partition[i].Row.SetColumn(windowKey, lastVal);
+                    }
+                }
+                break;
+
+            case "sum":
+            case "avg":
+            case "count":
+            case "min":
+            case "max":
+                ComputeAggregateWindow(funcName, func, window, partition, windowKey);
+                break;
+
+            default:
+                ComputeAggregateWindow(funcName, func, window, partition, windowKey);
+                break;
+        }
+    }
+
+    private void ComputeRank(FunctionCallExpression func, WindowSpec window,
+        List<(RowContext Row, int OriginalIndex)> partition, string windowKey, bool withGaps)
+    {
+        if (partition.Count == 0) return;
+
+        int rank = 1;
+        ClickHouseValue? prevValue = null;
+
+        for (int i = 0; i < partition.Count; i++)
+        {
+            var row = partition[i].Row;
+            var currentValue = window.OrderBy != null && window.OrderBy.Count > 0
+                ? _evaluator.Evaluate(window.OrderBy[0].Expression, row)
+                : null;
+
+            if (i == 0)
+            {
+                rank = 1;
+            }
+            else if (prevValue != null && currentValue != null && prevValue.Equals(currentValue))
+            {
+                // Same value, keep same rank
+            }
+            else
+            {
+                rank = withGaps ? i + 1 : rank + 1;
+            }
+
+            row.SetColumn(windowKey, new Int64Value(rank));
+            prevValue = currentValue;
+        }
+    }
+
+    private void ComputeLagLead(FunctionCallExpression func,
+        List<(RowContext Row, int OriginalIndex)> partition, string windowKey, bool isLag)
+    {
+        if (func.Arguments.Count == 0) return;
+
+        var offset = func.Arguments.Count > 1
+            ? (int)_evaluator.Evaluate(func.Arguments[1], new RowContext()).AsInt64()
+            : 1;
+
+        ClickHouseValue defaultVal = func.Arguments.Count > 2
+            ? _evaluator.Evaluate(func.Arguments[2], new RowContext())
+            : NullValue.Instance;
+
+        for (int i = 0; i < partition.Count; i++)
+        {
+            var targetIndex = isLag ? i - offset : i + offset;
+            ClickHouseValue value;
+
+            if (targetIndex >= 0 && targetIndex < partition.Count)
+                value = _evaluator.Evaluate(func.Arguments[0], partition[targetIndex].Row);
+            else
+                value = defaultVal;
+
+            partition[i].Row.SetColumn(windowKey, value);
+        }
+    }
+
+    private void ComputeAggregateWindow(string funcName, FunctionCallExpression func, WindowSpec window,
+        List<(RowContext Row, int OriginalIndex)> partition, string windowKey)
+    {
+        for (int i = 0; i < partition.Count; i++)
+        {
+            var frameStart = GetFrameStart(window.Frame, i, partition.Count);
+            var frameEnd = GetFrameEnd(window.Frame, i, partition.Count);
+
+            var frameRows = partition.Skip(frameStart).Take(frameEnd - frameStart + 1).Select(p => p.Row).ToList();
+            var value = ComputeAggregateOverFrame(funcName, func, frameRows);
+            partition[i].Row.SetColumn(windowKey, value);
+        }
+    }
+
+    private int GetFrameStart(WindowFrame? frame, int currentRow, int partitionSize)
+    {
+        if (frame == null) return 0;
+
+        return frame.Start.Type switch
+        {
+            WindowFrameBoundType.UnboundedPreceding => 0,
+            WindowFrameBoundType.CurrentRow => currentRow,
+            WindowFrameBoundType.Preceding => Math.Max(0, currentRow - GetOffset(frame.Start)),
+            WindowFrameBoundType.Following => Math.Min(partitionSize - 1, currentRow + GetOffset(frame.Start)),
+            _ => 0
+        };
+    }
+
+    private int GetFrameEnd(WindowFrame? frame, int currentRow, int partitionSize)
+    {
+        if (frame == null) return currentRow;
+
+        var bound = frame.End ?? frame.Start;
+        return bound.Type switch
+        {
+            WindowFrameBoundType.UnboundedFollowing => partitionSize - 1,
+            WindowFrameBoundType.CurrentRow => currentRow,
+            WindowFrameBoundType.Preceding => Math.Max(0, currentRow - GetOffset(bound)),
+            WindowFrameBoundType.Following => Math.Min(partitionSize - 1, currentRow + GetOffset(bound)),
+            _ => currentRow
+        };
+    }
+
+    private int GetOffset(WindowFrameBound bound)
+    {
+        if (bound.Offset == null) return 0;
+        return (int)_evaluator.Evaluate(bound.Offset, new RowContext()).AsInt64();
+    }
+
+    private ClickHouseValue ComputeAggregateOverFrame(string funcName, FunctionCallExpression func, List<RowContext> frameRows)
+    {
+        if (frameRows.Count == 0) return NullValue.Instance;
+
+        var values = func.Arguments.Count > 0
+            ? frameRows.Select(r => _evaluator.Evaluate(func.Arguments[0], r)).ToList()
+            : frameRows.Select(_ => new Int64Value(1) as ClickHouseValue).ToList();
+
+        var nonNullValues = values.Where(v => !v.IsNull).ToList();
+
+        return funcName switch
+        {
+            "sum" => nonNullValues.Count == 0 ? NullValue.Instance :
+                new Float64Value(nonNullValues.Sum(v => v.AsFloat64())),
+            "avg" => nonNullValues.Count == 0 ? NullValue.Instance :
+                new Float64Value(nonNullValues.Average(v => v.AsFloat64())),
+            "count" => new Int64Value(func.Arguments.Count == 0 ? frameRows.Count : nonNullValues.Count),
+            "min" => nonNullValues.Count == 0 ? NullValue.Instance :
+                nonNullValues.OrderBy(v => v).First(),
+            "max" => nonNullValues.Count == 0 ? NullValue.Instance :
+                nonNullValues.OrderByDescending(v => v).First(),
+            _ => NullValue.Instance
         };
     }
 

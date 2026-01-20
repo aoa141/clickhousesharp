@@ -14,6 +14,7 @@ A pure .NET implementation of ClickHouse SQL engine for local, in-memory query e
   - UNION, INTERSECT, EXCEPT
   - Common Table Expressions (CTEs)
   - Subqueries in FROM and WHERE clauses
+  - Window functions (ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, etc.)
   - CASE expressions
   - IN, BETWEEN, LIKE operators
 
@@ -114,6 +115,17 @@ foreach (var row in result.Rows)
 ### Table Functions
 - `numbers(N)` - Generate sequence 0 to N-1
 - `zeros(N)` - Generate N zero values
+
+### Window Functions
+- `row_number()` - Sequential row number within partition
+- `rank()` - Rank with gaps for ties
+- `dense_rank()` - Rank without gaps for ties
+- `ntile(n)` - Divide rows into n buckets
+- `lag(expr, [offset], [default])` - Access previous row value
+- `lead(expr, [offset], [default])` - Access next row value
+- `first_value(expr)` - First value in the window frame
+- `last_value(expr)` - Last value in the window frame
+- `sum() OVER`, `avg() OVER`, `count() OVER`, `min() OVER`, `max() OVER` - Running aggregates
 
 ## Examples
 
@@ -228,6 +240,33 @@ var result = ch.Execute(@"
 ");
 ```
 
+### Window Functions
+
+```csharp
+// Row numbering and ranking
+var result = ch.Execute(@"
+    SELECT name, score,
+           row_number() OVER (ORDER BY score DESC) AS position,
+           rank() OVER (ORDER BY score DESC) AS rank
+    FROM scores
+");
+
+// Running totals with PARTITION BY
+var result = ch.Execute(@"
+    SELECT category, amount,
+           sum(amount) OVER (PARTITION BY category ORDER BY date) AS running_total
+    FROM sales
+");
+
+// Lag/Lead for comparing to previous/next rows
+var result = ch.Execute(@"
+    SELECT date, value,
+           lag(value) OVER (ORDER BY date) AS prev_value,
+           value - lag(value) OVER (ORDER BY date) AS change
+    FROM metrics
+");
+```
+
 ## Running Tests
 
 ```bash
@@ -235,20 +274,20 @@ cd tests/ClickHouseSharp.Tests
 dotnet test
 ```
 
-The test suite includes 78 tests covering:
+The test suite includes 95 tests covering:
 - Basic SELECT operations
 - Aggregations and GROUP BY
 - All JOIN types
 - UNION, INTERSECT, EXCEPT
 - CTEs
 - Subqueries
+- Window functions
 - Built-in functions
 - DDL/DML operations
 
 ## Limitations
 
 - No persistent storage (in-memory only)
-- No window functions (planned)
 - No external file I/O yet (CSV/Parquet planned)
 - Subset of ClickHouse functions implemented
 
