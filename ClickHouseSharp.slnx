@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ClickHouseSharp/ClickHouseSharp.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ClickHouseSharp.Tests/ClickHouseSharp.Tests.csproj" />
+  </Folder>
+</Solution>
